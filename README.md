@@ -2,7 +2,7 @@
 
 **Traceroute, but it tells you *who owns* every router along the way, and how fast each one answers.**
 
-A plain `traceroute` gives you a wall of IP addresses and leaves you to guess what they are. This tool runs the traceroute for you, then looks up every hop in your own local MySQL database and tells you the network, ASN, company and country behind it, plus latency and packet loss per hop. It speaks IPv4 and IPv6, uses colour so problems jump out, and has a `--json` mode for scripts. No third-party API, no rate limits, no sending your lookups to someone else's server.
+A plain `traceroute` gives you a wall of IP addresses and leaves you to guess what they are. This tool runs the traceroute for you, then looks up every hop in your own local MySQL database and tells you the network, ASN, company and country behind it, plus latency and packet loss per hop. It speaks IPv4 and IPv6, uses colour so problems jump out, can look up reverse-DNS names, exports to `--json` or `--csv` for scripts and spreadsheets, and has a live, refreshing `--mtr` mode for watching a path over time. No third-party API, no rate limits, no sending your lookups to someone else's server.
 
 ```
 Traceroute to google.com (142.250.74.14), IPv4, max 30 hops
@@ -42,6 +42,9 @@ If you just want a quick one-off lookup, a web tool is easier. If you want to ru
 - 🌐 **IPv4 and IPv6**: auto-detects from the target, or force it with `-4` / `-6`.
 - 🎨 **Colour output**: latency is green / yellow / red, ASNs and countries stand out, private hops fade into the background. Auto-disabled when piped, or with `--no-color` / the `NO_COLOR` environment variable.
 - 🧾 **`--json` mode**: one clean JSON document with every hop and a summary, ready for `jq`, scripts or dashboards.
+- 📑 **`--csv` mode**: one row per hop address, streamed as the trace runs. Opens straight in Excel, LibreOffice or pandas.
+- 🏷 **`--resolve`**: reverse-DNS hostname for every hop (`ae-1.r21.frnkge08.de.bb.gin.ntt.net` says a lot more than an IP).
+- 📡 **`--mtr` live mode**: a refreshing, MTR-style table with loss %, last / avg / best / worst latency and standard deviation per hop, plus the same network info.
 - ⏱ **Per-hop latency and loss**: min / avg / max RTT and packet loss for every hop.
 - 📋 **Summary at the end**: whether the destination was reached, the slowest hop, the biggest latency jump between hops, which hops lost packets, and the path of countries and networks your traffic crossed.
 - 🖥 Wraps the system traceroute, so it works on **Windows** (`tracert`) and **Linux/macOS** (`traceroute`) without admin or root.
@@ -61,6 +64,7 @@ If you just want a quick one-off lookup, a web tool is easier. If you want to ru
 - Python 3.8+
 - A MySQL / MariaDB server with your GeoIP data (see below)
 - `traceroute` installed on Linux (`sudo apt install traceroute`); Windows has `tracert` built in
+- `ping` (already present on Windows, Linux and macOS), only needed for `--mtr`
 
 ```bash
 pip install pymysql
@@ -70,7 +74,17 @@ pip install cryptography
 
 ### 2. Set up the database
 
-The tool expects a database called `geoip`. IPv4 and IPv6 each get one or more tables, with the same columns but different types for the address range.
+**Quickest way:** this repo ships `geoip.zip`, a phpMyAdmin dump containing `geoip.sql` with the `all_ipv4` and `pl_ipv4` tables. Unzip it, create the database, and import:
+
+```bash
+unzip geoip.zip
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS geoip CHARACTER SET utf8mb4"
+mysql -u root -p geoip < geoip.sql
+```
+
+The dump already includes the `(ip_start, ip_end)` index, so lookups are fast straight away. It has no IPv6 tables; IPv6 hops show *"no IPv6 table in database"* until you add some (see below).
+
+**Or build your own.** The tool expects a database called `geoip`. IPv4 and IPv6 each get one or more tables, with the same columns but different types for the address range.
 
 **IPv4 tables** (`all_ipv4`, optionally `pl_ipv4`, ...): addresses stored as integers.
 
@@ -182,10 +196,14 @@ GRANT SELECT ON geoip.* TO 'geoip_reader'@'%';
 ### 4. Run it
 
 ```bash
-python traceroute_geoip.py google.com
-python traceroute_geoip.py 1.1.1.1 --max-hops 20
-python traceroute_geoip.py ipv6.google.com -6
-python traceroute_geoip.py example.com --json > trace.json
+python main.py google.com
+python main.py 1.1.1.1 --max-hops 20
+python main.py ipv6.google.com -6
+python main.py example.com --resolve              # add reverse-DNS names
+python main.py example.com --json > trace.json
+python main.py example.com --csv > trace.csv
+python main.py example.com --mtr                   # live view, Ctrl+C to quit
+python main.py example.com --mtr --count 20 --csv > mtr.csv
 ```
 
 Press `Ctrl+C` to stop early; you still get the summary for the hops collected so far.
@@ -197,7 +215,13 @@ Press `Ctrl+C` to stop early; you still get the summary for the hops collected s
 | `target` | Hostname or IP address |
 | `-4` / `-6` | Force IPv4 or IPv6 (default: auto, preferring IPv4 if a name has both) |
 | `--max-hops N` | Maximum number of hops (default 30) |
+| `--resolve` | Look up the reverse-DNS hostname of every hop (2 s timeout per hop) |
 | `--json` | Print a single JSON document instead of text |
+| `--csv` | Print CSV (one row per hop address) instead of text. Can't be combined with `--json` |
+| `--mtr` | Live, refreshing MTR-style view (see below) |
+| `--count N` | With `--mtr`: stop after N rounds (default: run until `Ctrl+C`) |
+| `--interval SEC` | With `--mtr`: seconds between rounds (default 1) |
+| `--ping-timeout SEC` | With `--mtr`: how long to wait for each ping (default 1) |
 | `--no-color` | Disable colour (also honours the `NO_COLOR` environment variable) |
 | `--config PATH` | Use a config file other than `config.ini` next to the script |
 | `--tables-v4 a,b` | IPv4 tables to search, in order (overrides `[tables]` in the config) |
@@ -269,22 +293,68 @@ Each hop line shows:
 }
 ```
 
-The `kind` field is one of `match`, `private`, `loopback`, `link-local`, `cgnat` or `unknown`. Handy one-liners:
+The `kind` field is one of `match`, `private`, `loopback`, `link-local`, `cgnat` or `unknown`. With `--resolve`, each address also gets a `hostname` field (`null` when there is no reverse-DNS record). Handy one-liners:
 
 ```bash
 # Just the list of ASNs on the path
-python traceroute_geoip.py example.com --json | jq -r '.summary.networks_path[] | "AS\(.asn) \(.company)"'
+python main.py example.com --json | jq -r '.summary.networks_path[] | "AS\(.asn) \(.company)"'
 
 # Hops slower than 100 ms
-python traceroute_geoip.py example.com --json | jq '.hops[] | select(.rtt_ms.avg > 100) | .hop'
+python main.py example.com --json | jq '.hops[] | select(.rtt_ms.avg > 100) | .hop'
 ```
+
+### CSV output
+
+`--csv` writes a header and then one row per hop address, as each hop arrives. A hop that didn't answer gets a row with an empty `ip`; a hop that answered from several addresses (load balancing) gets one row per address, each repeating the hop's latency figures.
+
+```
+hop,ip,hostname,ip_version,kind,cidr,asn,company,prefix_country,as_country,probes_sent,timeouts,loss_pct,rtt_min_ms,rtt_avg_ms,rtt_max_ms
+1,192.168.1.1,,4,private,,,,,,3,0,0.0,1.0,1.2,1.5
+2,,,,,,,,,,3,3,100.0,,,
+3,83.238.12.1,,4,match,83.238.0.0/16,5617,Orange Polska Spolka Akcyjna,PL,PL,3,0,0.0,11.1,11.8,12.9
+```
+
+Values containing commas or quotes (company names often do) are quoted properly, so the file loads cleanly in spreadsheets and `pandas.read_csv`.
+
+### Reverse DNS (`--resolve`)
+
+Add `--resolve` and every responding hop gets its PTR hostname appended to the line, in the text, JSON, CSV and `--mtr` outputs. Lookups for a hop run in parallel, give up after 2 seconds, and are cached, so one slow DNS server can't stall the trace. Hops with no PTR record simply show no name.
+
+```
+  4  72.14.213.30       24.3 ms  (23.8-25.1)       72.14.192.0/18 | AS15169 | GOOGLE - Google LLC | US  lhr48s30-in-f14.1e100.net
+```
+
+### Live mode (`--mtr`)
+
+A one-shot traceroute is a snapshot. `--mtr` turns it into a live view that updates every second, like the classic `mtr` tool, so you can watch loss and jitter build up over time:
+
+```
+Live trace to example.com (93.184.216.34)   round 42   Ctrl+C to quit
+     Host              Loss%  Snt    Last     Avg    Best    Wrst   StDev  Network
+  1  192.168.1.1        0.0%   42     1.0     1.3     0.9     2.8     0.4  private / local network
+  2  10.20.0.1          0.0%   42     3.1     3.3     2.9     5.0     0.5  private / local network
+  3  83.238.12.1        2.4%   42    11.8    12.4    11.0    19.6     1.6  83.238.0.0/16 | AS5617 | Orange Polska Spolka Akcyjna | PL
+  4  93.184.216.34      0.0%   42    24.3    24.6    23.8    31.2     1.1  93.184.216.0/24 | AS15133 | EDGECAST - Edgecast Inc. | US
+```
+
+*(Example output. Latency is colour-coded and loss turns red in a real terminal.)*
+
+How it works: the route is discovered once with the normal traceroute, then every hop's address is pinged once per round, in parallel. For each hop you get loss %, packets sent, and last / average / best / worst latency and standard deviation, next to the usual network, ASN, company and country.
+
+- Press `Ctrl+C` to stop. The last screen stays on your terminal.
+- `--count N` stops after N rounds, which is handy for scripts.
+- With `--json` or `--csv`, nothing is drawn live; you get one final document when the run ends (by `--count` or `Ctrl+C`). Progress messages go to stderr, so stdout stays clean.
+- If stdout isn't a terminal (you piped it), only the final table is printed.
+- Hops that never answered the initial traceroute show as `???` and aren't pinged.
+
+**A caveat:** unlike plain traceroute, `--mtr` pings each router's own address directly. Many routers treat that differently from traffic passing *through* them (rate-limiting it or ignoring it), so loss on a middle hop that vanishes on the hops after it is usually harmless. The destination's numbers are the ones to trust.
 
 ---
 
 ## 🛠 How it works
 
 1. Resolves the target hostname to an IPv4 or IPv6 address.
-2. Launches `tracert -d` or `traceroute -n` (no reverse DNS, which keeps it fast).
+2. Launches `tracert -d` or `traceroute -n` (no reverse DNS by default, which keeps it fast; `--resolve` adds it back in a controlled, time-limited way).
 3. Reads the output line by line and pulls the IPs, round-trip times and `*` timeouts out of each hop.
 4. Looks up each IP. For IPv4 it converts the address to an integer and runs:
 
@@ -298,6 +368,7 @@ python traceroute_geoip.py example.com --json | jq '.hops[] | select(.rtt_ms.avg
 
    The `ORDER BY` picks the narrowest range, which is the most specific match, the same way real routing works. For IPv6 the address is compared as 16 raw bytes, and because CIDR ranges nest, the most specific range is simply the one with the greatest `ip_start`.
 5. Prints the result next to the hop, then a summary once the trace finishes.
+6. In `--mtr` mode, it then pings each discovered hop once per round and keeps running statistics (Welford's algorithm for the standard deviation, so memory stays constant however long you leave it running).
 
 ---
 
@@ -315,6 +386,10 @@ python traceroute_geoip.py example.com --json | jq '.hops[] | select(.rtt_ms.avg
 | IPv6 hops show `no IPv6 table in database` | Create an `all_ipv6` table (see above), or point `--tables-v6` at your table names. |
 | IPv6 traces fail or show only `*` | Your machine or network may not have working IPv6. Try `-4`. |
 | Colours look like garbage (`←[32m`) | Use a modern terminal (Windows Terminal / PowerShell 7) or pass `--no-color`. |
+| `--mtr`: "No hop answered the traceroute" | Nothing replied during route discovery. Try a different target, or check that your firewall allows traceroute. |
+| `--mtr` shows 100% loss on a hop but later hops are fine | That router ignores direct pings. It's harmless; traffic still passes through it. |
+| `--mtr` screen flickers or fills with escape codes | Use a modern terminal (Windows Terminal / PowerShell 7), or pipe to a file / use `--count` for a single final table. |
+| `--resolve` is slow | Your DNS server is slow to answer PTR queries. Each hop waits at most 2 seconds, and results are cached. |
 | Lookups feel slow | Add an index on `(ip_start, ip_end)`. |
 
 ---
@@ -322,9 +397,9 @@ python traceroute_geoip.py example.com --json | jq '.hops[] | select(.rtt_ms.avg
 ## 🗺 Ideas / roadmap
 
 - Optional caching of repeated lookups
-- Per-hop reverse DNS (`--resolve`)
-- CSV output
-- Live, refreshing "MTR-style" mode
+- Probing each TTL directly in `--mtr` mode (so middle hops reflect real transit, not just ping replies)
+- Saving an `--mtr` run's history for graphs
+- Packaging (`pip install`) with a proper console script
 
 PRs and ideas are welcome. 🎉
 
@@ -332,7 +407,7 @@ PRs and ideas are welcome. 🎉
 
 ## 🔒 A note on privacy and security
 
-- Lookups happen against **your own database**, so the IPs you trace never leave your network (apart from the traceroute packets themselves, of course).
+- Network lookups happen against **your own database**, so the IPs you trace are never sent to a third-party API. The only traffic that leaves your machine is the traceroute/ping packets themselves and, if you use `--resolve`, ordinary reverse-DNS queries to whatever DNS server your system is configured to use.
 - Use a **read-only** database user and restrict who can reach port 3306.
 - Credentials live only in `config.ini`, which is git-ignored. Never commit it, and never put real values in `config.example.ini`.
 
@@ -340,7 +415,7 @@ PRs and ideas are welcome. 🎉
 
 ## 📄 License
 
-Pick a licence (MIT is a popular choice for small tools like this) and add a `LICENSE` file.
+MIT. See [`LICENSE`](LICENSE). If you redistribute the data in `geoip.zip`, make sure the licence of the dataset it was built from allows that.
 
 ---
 
