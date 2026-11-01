@@ -185,7 +185,7 @@ PRs and ideas are welcome. 🎉
 
 ## 📄 License
 
-Pick a licence (MIT is a popular choice for small tools like this) and add a `LICENSE` file.
+Released under the [MIT License](LICENSE).
 
 ---
 
