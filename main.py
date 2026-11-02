@@ -281,8 +281,10 @@ def build_command(ip, max_hops):
     system = platform.system()
     if system == "Windows":
         return ["tracert", "-d", f"-{ip.version}", "-h", str(max_hops), str(ip)]
-    if system == "Darwin" and ip.version == 6:
-        return ["traceroute6", "-n", "-m", str(max_hops), str(ip)]
+    if system == "Darwin":
+        # macOS (BSD) traceroute has no -4/-6 flags; IPv6 uses a separate binary.
+        tool = "traceroute6" if ip.version == 6 else "traceroute"
+        return [tool, "-n", "-m", str(max_hops), str(ip)]
     return ["traceroute", "-n", f"-{ip.version}", "-m", str(max_hops), str(ip)]
 
 
@@ -354,11 +356,14 @@ def run_traceroute(target_ip, max_hops, db, resolver, on_hop):
         die(f"{cmd[0]} not found. On Debian/Ubuntu: sudo apt install traceroute")
 
     hops = []
+    other = []  # lines that aren't hops: headers, or error messages from the tool
     interrupted = False
     try:
         for line in proc.stdout:
             parsed = parse_hop(line)
             if not parsed:
+                if line.strip():
+                    other.append(line.rstrip())
                 continue
             hop = make_hop(parsed, db, resolver)
             hops.append(hop)
@@ -366,6 +371,12 @@ def run_traceroute(target_ip, max_hops, db, resolver, on_hop):
     except KeyboardInterrupt:
         interrupted = True
         proc.terminate()
+
+    if not hops and not interrupted:
+        # Don't fail silently: show what the traceroute command actually said.
+        print(f"No hops were read from: {' '.join(cmd)}", file=sys.stderr)
+        for line in other[-5:]:
+            print(f"  {line}", file=sys.stderr)
     return hops, interrupted
 
 
