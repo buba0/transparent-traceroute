@@ -283,8 +283,10 @@ def build_command(ip, max_hops):
         return ["tracert", "-d", f"-{ip.version}", "-h", str(max_hops), str(ip)]
     if system == "Darwin":
         # macOS (BSD) traceroute has no -4/-6 flags; IPv6 uses a separate binary.
+        # BSD traceroute sends probes one at a time and waits 5 s for each
+        # unanswered one, so cap the wait at 2 s.
         tool = "traceroute6" if ip.version == 6 else "traceroute"
-        return [tool, "-n", "-m", str(max_hops), str(ip)]
+        return [tool, "-n", "-w", "2", "-m", str(max_hops), str(ip)]
     return ["traceroute", "-n", f"-{ip.version}", "-m", str(max_hops), str(ip)]
 
 
@@ -344,14 +346,63 @@ def make_hop(parsed, db, resolver=None):
     return hop
 
 
-def run_traceroute(target_ip, max_hops, db, resolver, on_hop):
-    """Run the system traceroute, calling on_hop(hop) as each hop arrives."""
-    cmd = build_command(target_ip, max_hops)
-    try:
+def spawn_lines(cmd, use_pty=None):
+    """
+    Start cmd and return (process, iterator of output lines).
+
+    On macOS, traceroute block-buffers its output when writing to a pipe, so
+    nothing appears until the whole trace has finished. Giving it a pseudo
+    terminal makes it flush every line as it is printed, so hops stream in live.
+    """
+    if use_pty is None:
+        use_pty = platform.system() == "Darwin"
+
+    if use_pty:
+        try:
+            import pty
+            master, slave = pty.openpty()
+        except (ImportError, OSError):
+            use_pty = False
+
+    if not use_pty:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
         )
+        return proc, proc.stdout
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=slave, stderr=slave, stdin=subprocess.DEVNULL)
+    finally:
+        os.close(slave)
+
+    def lines():
+        buf = b""
+        try:
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # Linux reports EIO when the child closes the pty
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    yield line.decode("utf-8", errors="replace").rstrip("\r") + "\n"
+            if buf:
+                yield buf.decode("utf-8", errors="replace")
+        finally:
+            os.close(master)
+
+    return proc, lines()
+
+
+def run_traceroute(target_ip, max_hops, db, resolver, on_hop):
+    """Run the system traceroute, calling on_hop(hop) as each hop arrives."""
+    cmd = build_command(target_ip, max_hops)
+    try:
+        proc, output = spawn_lines(cmd)
     except FileNotFoundError:
         die(f"{cmd[0]} not found. On Debian/Ubuntu: sudo apt install traceroute")
 
@@ -359,7 +410,7 @@ def run_traceroute(target_ip, max_hops, db, resolver, on_hop):
     other = []  # lines that aren't hops: headers, or error messages from the tool
     interrupted = False
     try:
-        for line in proc.stdout:
+        for line in output:
             parsed = parse_hop(line)
             if not parsed:
                 if line.strip():
