@@ -319,26 +319,27 @@ def parse_hop(line):
     return {"hop": hop, "ips": ips, "rtts": rtts, "timeouts": stars}
 
 
+def describe_ip(db, ip):
+    try:
+        return db.describe(ip)
+    except pymysql.MySQLError as e:
+        return {"ip": str(ip), "version": ip.version,
+                "kind": "unknown", "note": f"DB error: {e}"}
+
+
 def make_hop(parsed, db, resolver=None):
     """Turn a parsed traceroute line into a hop dict with GeoIP (and DNS) data."""
     rtts = parsed["rtts"]
     sent = len(rtts) + parsed["timeouts"]
     hop = {
         "hop": parsed["hop"],
-        "ips": [],
+        "ips": [describe_ip(db, ip) for ip in parsed["ips"]],
         "probes_sent": sent,
         "timeouts": parsed["timeouts"],
         "loss_pct": round(parsed["timeouts"] / sent * 100, 1) if sent else 0.0,
         "rtt_ms": ({"min": min(rtts), "avg": round(statistics.mean(rtts), 2),
                     "max": max(rtts)} if rtts else None),
     }
-    for ip in parsed["ips"]:
-        try:
-            hop["ips"].append(db.describe(ip))
-        except pymysql.MySQLError as e:
-            hop["ips"].append({"ip": str(ip), "version": ip.version,
-                               "kind": "unknown", "note": f"DB error: {e}"})
-
     if resolver and hop["ips"]:
         names = resolver.resolve_many([i["ip"] for i in hop["ips"]])
         for info in hop["ips"]:
@@ -453,6 +454,17 @@ def geo_text(info, pal):
         country_txt = country
     parts.append(pal(country_txt, "cyan"))
     return " | ".join(parts)
+
+
+def destination_text(db, ip, pal):
+    info = describe_ip(db, ip)
+    if info["kind"] == "match":
+        company = info["company"]
+        asn = f"AS{info['asn']}" if info["asn"] else None
+        network = " | ".join(part for part in (company, asn) if part) or info["cidr"]
+    else:
+        network = geo_text(info, pal)
+    return f"{ip} | {network}"
 
 
 def geo_and_host(info, pal):
@@ -754,12 +766,12 @@ def run_mtr(hops, count, interval, ping_timeout, on_round, ping=ping_once):
     return stats, rounds, False
 
 
-def render_mtr(hops, stats, rounds, pal, ip_width, target, target_ip):
+def render_mtr(hops, stats, rounds, pal, ip_width, target, destination):
     def num(v, style=None):
         return pal(("-" if v is None else f"{v:.1f}").rjust(7), style)
 
     lines = [
-        f"{pal('Live trace', 'bold')} to {pal(target, 'bold')} ({target_ip})"
+        f"{pal('Live trace', 'bold')} to {pal(target, 'bold')} ({destination})"
         f"   round {rounds}   Ctrl+C to quit",
         pal(f"{'':>3}  {'Host':<{ip_width}}  {'Loss%':>6} {'Snt':>4} {'Last':>7} {'Avg':>7} "
             f"{'Best':>7} {'Wrst':>7} {'StDev':>7}  Network", "dim"),
@@ -801,7 +813,8 @@ def do_trace(args, target_ip, db, resolver, pal):
         writer = csv.writer(sys.stdout, lineterminator="\n")
         writer.writerow(TRACE_CSV_HEADER)
     elif not args.json:
-        print(f"Traceroute to {pal(args.target, 'bold')} ({target_ip}), "
+        destination = destination_text(db, target_ip, pal)
+        print(f"Traceroute to {pal(args.target, 'bold')} ({destination}), "
               f"IPv{target_ip.version}, max {args.max_hops} hops\n")
 
     def on_hop(h):
@@ -845,8 +858,10 @@ def do_mtr(args, target_ip, db, resolver, pal):
     ip_width = 15 if target_ip.version == 4 else 39
 
     # 1) discover the route once
+    destination = None
     if not quiet:
-        print(f"Discovering route to {args.target} ({target_ip}) ...", file=sys.stderr)
+        destination = destination_text(db, target_ip, pal)
+        print(f"Discovering route to {args.target} ({destination}) ...", file=sys.stderr)
 
     def on_discovered(h):
         if not quiet:
@@ -865,7 +880,7 @@ def do_mtr(args, target_ip, db, resolver, pal):
     def on_round(stats, rounds):
         if not live:
             return
-        lines = render_mtr(hops, stats, rounds, pal, ip_width, args.target, target_ip)
+        lines = render_mtr(hops, stats, rounds, pal, ip_width, args.target, destination)
         clear = "\033[2J" if first_frame[0] else ""
         first_frame[0] = False
         sys.stdout.write(clear + "\033[H" + "\033[K\n".join(lines) + "\033[K\n\033[J")
@@ -896,7 +911,7 @@ def do_mtr(args, target_ip, db, resolver, pal):
     elif live:
         print("\nStopped." if interrupted else "\nDone.")
     else:
-        print("\n".join(render_mtr(hops, stats, rounds, pal, ip_width, args.target, target_ip)))
+        print("\n".join(render_mtr(hops, stats, rounds, pal, ip_width, args.target, destination)))
 
 
 def main():
