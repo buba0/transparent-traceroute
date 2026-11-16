@@ -537,12 +537,24 @@ def build_summary(hops, target_ip):
     }
 
 
-def print_summary(s, pal):
+def print_destination_ping(rtt, pal, interrupted, stream=None):
+    if interrupted:
+        status = pal("skipped", "dim")
+    elif rtt is None:
+        status = pal("no reply", "red")
+    else:
+        status = pal(f"reply ({rtt:g} ms)", "green")
+    print(f"  Destination ping    : {status}", file=stream)
+
+
+def print_summary(s, pal, interrupted):
     print()
     print(pal("Summary", "bold"))
     reached = pal("yes", "green") if s["destination_reached"] else pal("no", "red")
     print(f"  Destination reached : {reached} ({s['total_hops']} hops, "
           f"{s['responding_hops']} responded)")
+
+    print_destination_ping(s["destination_ping_rtt_ms"], pal, interrupted)
 
     if s["slowest_hop"]:
         ms = s["slowest_hop"]["avg_ms"]
@@ -706,6 +718,8 @@ def ping_once(ip, timeout=1.0):
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
+    if result.returncode != 0:
+        return None
     return parse_ping_rtt(result.stdout)
 
 
@@ -798,7 +812,15 @@ def do_trace(args, target_ip, db, resolver, pal):
             print_hop(h, pal, ip_width)
 
     hops, interrupted = run_traceroute(target_ip, args.max_hops, db, resolver, on_hop)
+    ping_rtt = None
+    if not interrupted:
+        try:
+            ping_rtt = ping_once(target_ip, args.ping_timeout)
+        except KeyboardInterrupt:
+            interrupted = True
+
     summary = build_summary(hops, target_ip)
+    summary["destination_ping_rtt_ms"] = ping_rtt
 
     if args.json:
         print(json.dumps({
@@ -809,10 +831,12 @@ def do_trace(args, target_ip, db, resolver, pal):
             "hops": hops,
             "summary": summary,
         }, indent=2, ensure_ascii=False))
-    elif not args.csv:
+    elif args.csv:
+        print_destination_ping(ping_rtt, Palette(False), interrupted, stream=sys.stderr)
+    else:
         if interrupted:
             print("\nInterrupted.")
-        print_summary(summary, pal)
+        print_summary(summary, pal, interrupted)
 
 
 def do_mtr(args, target_ip, db, resolver, pal):
@@ -899,8 +923,8 @@ def main():
                      help="stop --mtr after N rounds (default: run until Ctrl+C)")
     mtr.add_argument("--interval", type=float, default=1.0, metavar="SEC",
                      help="seconds between --mtr rounds (default 1)")
-    mtr.add_argument("--ping-timeout", type=float, default=1.0, metavar="SEC",
-                     help="seconds to wait for each --mtr ping (default 1)")
+    p.add_argument("--ping-timeout", type=float, default=1.0, metavar="SEC",
+                   help="seconds to wait for a ping reply (default 1)")
 
     p.add_argument("--config", default=str(DEFAULT_CONFIG),
                    help="path to the config file (default: config.ini next to the script)")
@@ -912,7 +936,7 @@ def main():
 
     if args.count < 0:
         p.error("--count must be 0 or more")
-    if args.interval <= 0 or args.ping_timeout <= 0:
+    if args.interval <= 0 or not math.isfinite(args.ping_timeout) or args.ping_timeout <= 0:
         p.error("--interval and --ping-timeout must be greater than 0")
 
     cfg = load_config(args.config)
