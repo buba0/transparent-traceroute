@@ -556,17 +556,15 @@ def print_destination_ping(rtt, pal, interrupted, stream=None):
         status = pal("no reply", "red")
     else:
         status = pal(f"reply ({rtt:g} ms)", "green")
-    print(f"  Destination ping    : {status}", file=stream)
+    print(f"  Destination ping    : {status}", file=stream, flush=True)
 
 
-def print_summary(s, pal, interrupted):
+def print_summary(s, pal):
     print()
     print(pal("Summary", "bold"))
     reached = pal("yes", "green") if s["destination_reached"] else pal("no", "red")
     print(f"  Destination reached : {reached} ({s['total_hops']} hops, "
           f"{s['responding_hops']} responded)")
-
-    print_destination_ping(s["destination_ping_rtt_ms"], pal, interrupted)
 
     if s["slowest_hop"]:
         ms = s["slowest_hop"]["avg_ms"]
@@ -815,7 +813,7 @@ def do_trace(args, target_ip, db, resolver, pal):
     elif not args.json:
         destination = destination_text(db, target_ip, pal)
         print(f"Traceroute to {pal(args.target, 'bold')} ({destination}), "
-              f"IPv{target_ip.version}, max {args.max_hops} hops\n")
+              f"IPv{target_ip.version}, max {args.max_hops} hops", flush=True)
 
     def on_hop(h):
         if writer:
@@ -824,13 +822,22 @@ def do_trace(args, target_ip, db, resolver, pal):
         elif not args.json:
             print_hop(h, pal, ip_width)
 
-    hops, interrupted = run_traceroute(target_ip, args.max_hops, db, resolver, on_hop)
-    ping_rtt = None
+    interrupted = False
+    try:
+        ping_rtt = ping_once(target_ip, args.ping_timeout)
+    except KeyboardInterrupt:
+        ping_rtt = None
+        interrupted = True
+
+    if args.csv:
+        print_destination_ping(ping_rtt, Palette(False), interrupted, stream=sys.stderr)
+    elif not args.json:
+        print_destination_ping(ping_rtt, pal, interrupted)
+        print()
+
+    hops = []
     if not interrupted:
-        try:
-            ping_rtt = ping_once(target_ip, args.ping_timeout)
-        except KeyboardInterrupt:
-            interrupted = True
+        hops, interrupted = run_traceroute(target_ip, args.max_hops, db, resolver, on_hop)
 
     summary = build_summary(hops, target_ip)
     summary["destination_ping_rtt_ms"] = ping_rtt
@@ -844,12 +851,10 @@ def do_trace(args, target_ip, db, resolver, pal):
             "hops": hops,
             "summary": summary,
         }, indent=2, ensure_ascii=False))
-    elif args.csv:
-        print_destination_ping(ping_rtt, Palette(False), interrupted, stream=sys.stderr)
-    else:
+    elif not args.csv:
         if interrupted:
             print("\nInterrupted.")
-        print_summary(summary, pal, interrupted)
+        print_summary(summary, pal)
 
 
 def do_mtr(args, target_ip, db, resolver, pal):
